@@ -1,0 +1,517 @@
+---
+title: "Rask oppdatering av SVM og eksperiment med ML"
+output: html_notebook
+---
+
+```{r,include=F}
+#prepping
+
+#fjerner alt fra forrige gang
+rm(list = ls())
+
+#for algoritmer som bruker seed
+set.seed(1106)
+
+#biblioteker
+library(dplyr)
+library(knitr)
+library(httr)
+library(jsonlite)
+library(ggplot2)
+library(tidyr)
+library(lpSolve)
+library(readr)
+library(caret)
+library(kernlab)
+library(forcats)
+library(lme4)
+
+#scripts
+source("scripts/datagrabbing_function.R")
+source("scripts/teamchooser_function.R")
+source("scripts/modelldiagnose_function.R")
+source("scripts/dataprepper_function.R")
+source("scripts/kampdatagrabber.R")
+
+#data til estimering av modell
+#HUSK å oppdatere dataprepper()-funksjonen
+df_estimering = dataprepper()
+#NA-håndtering og symmetrifisering
+count(select(df_estimering,id_player,round),round)
+#fjerner aller først siste runde, med NA i points_nextround
+df_estimering = filter(df_estimering,round<16)
+#gjør noen variabler til faktorer
+df_estimering$element_type = as.factor(df_estimering$element_type)
+df_estimering$team = as.factor(df_estimering$team)
+df_estimering$status = as.factor(df_estimering$status)
+#fjerner verdier med na i points_nextround
+na_filter = filter(df_estimering,is.na(points_nextround),round<16)
+warning(paste0("Dropper",nrow(distinct(na_filter,id_player))," spillere med NA i points_nextround"))
+df_estimering = anti_join(df_estimering,na_filter,by=c("id_player","round"))
+
+na_filter = filter(df_estimering,is.na(ep_next))
+warning(paste0("Dropper",nrow(distinct(na_filter,id_player))," spillere med NA i ep_next"))
+df_estimering = anti_join(df_estimering,na_filter,by=c("id_player","round"))
+
+df_original = df_estimering
+        
+#lagvelgemaskinen skal sette laget til neste runde
+lagvelgemaskin = function(temp_df=df_estimering,runde=1){
+        for(j in min(runde):max(runde)){
+                temp_df$team_now[temp_df$round==(j+1)] = NA #hva tenkte jeg her? 
+        }
+        temp_df$team_now[temp_df$round==1] = temp_df$team_1[temp_df$round==1]
+        for(j in min(runde):max(runde)){
+                temp_optimized = teamchooser(filter(temp_df,round==j,is.na(prediksjon)==FALSE),incremental=TRUE,num_nowteamers=14,max_team_cost=1000,prediksjon=TRUE)
+                temp_optimized[[2]]$round = temp_optimized[[2]]$round+1
+                temp_df = left_join(temp_df,select(temp_optimized[[2]],id_player,round,solution_incremental))
+                temp_df$team_now[temp_df$round==(j+1)] <- temp_df$solution_incremental[temp_df$round==(j+1)]
+                temp_df = select(temp_df,-solution_incremental)                
+        }
+        return(temp_df)
+}
+
+lagvelgemaskin_full = function(temp_df=df_estimering,runde=1){
+        for(i in min(runde):max(runde)){
+                temp_df$team_now[temp_df$round==i] = NA
+        }
+        temp_df$team_now[temp_df$round==1] = temp_df$team_1[temp_df$round==1]
+        for(i in min(runde):max(runde)){
+                temp_optimized = teamchooser(filter(temp_df,round==i,is.na(prediksjon)==FALSE),incremental=FALSE,max_team_cost=1000,prediksjon=TRUE)
+                temp_df$team_now[temp_df$round==(i+1)] = temp_optimized[[2]]$solution_full
+        }
+        return(temp_df)
+}
+
+#poengberegningsmaskin
+#tar en df med originale data og en df med team_now for spillere over rundene
+poengberegningsmaskin = function(df_original,df_estimering,modell="benchmark",runde=1){
+        df_poeng = left_join(df_original,select(df_estimering,id_player,round,team_now))%>%
+                filter(round<=max(runde),round>=min(runde))%>%
+                filter(team_now==1)%>%
+                group_by(round)%>%
+                summarise(.,"Poeng"=sum(total_points,na.rm=T),
+                  "Lagmedlemmer" = sum(team_now)
+                  )
+        df_poeng$modell = modell
+        return(df_poeng)
+}
+```
+
+##Forbedring av SVM
+
+Den eksisterende modellen tar ikke hensyn til statuskoder. Jeg tar en sjekk av om dette forbedrer presisjonen.
+
+
+```{r}
+#MODEL SVM radial - tuneLength=3
+
+#variabler mm
+df_estimering$prediksjon = 0
+df_resultater = data.frame()
+df_resultater_compare = data.frame()
+df_estimering_compare = data.frame()
+
+##kontroll
+train_nr = floor(nrow(filter(df_estimering,round==1))*.8)
+test_nr = ceiling(nrow(filter(df_estimering,round==1))*.2)
+kontroll = trainControl(method="timeslice",initialWindow=train_nr,horizon=test_nr,fixedWindow=TRUE)
+
+##loop
+for(k in 1:3){
+        for(i in min(df_estimering$round):max(df_estimering$round)){
+                if(i==1){
+                        modell_svm = train(points_nextround~total_points+I(total_points^2)+rundepoeng+now_cost+selected+as.factor(element_type)+as.factor(team)+ep_next,
+                                data = arrange(filter(df_estimering,round==1),round),
+                                method = "svmRadial",
+                                tuneLength = 3,
+                                trControl = kontroll
+                                )
+                        df_estimering$prediksjon[df_estimering$round==1] = predict(modell_svm,newdata=filter(df_estimering,round==1))
+                df_estimering = lagvelgemaskin(df_estimering,runde=1)
+                df_resultater = bind_rows(df_resultater,data.frame(poengberegningsmaskin(df_original,df_estimering,modell="svm_radial",runde=1)))
+                        }
+                if(i>1){
+                        modell_svm = train(points_nextround~total_points+I(total_points^2)+rundepoeng+now_cost+selected+as.factor(element_type)+as.factor(team)+ep_next,
+                                data = arrange(filter(df_estimering,round<i),round),
+                                method = "svmRadial",
+                                tuneLength = 3,
+                                trControl = kontroll
+                                )
+                        df_estimering$prediksjon[df_estimering$round==i] = predict(modell_svm,newdata=filter(df_estimering,round==i))
+                        df_estimering = lagvelgemaskin(df_estimering,runde=i)
+                df_resultater = bind_rows(df_resultater,poengberegningsmaskin(df_original,df_estimering,modell="svm_radial",runde=i))
+                }
+        }
+        df_resultater$run = k
+        df_resultater$test = "baseline"
+        df_resultater_compare = bind_rows(df_resultater_compare,df_resultater)
+        df_resultater = data.frame() #må nullstille denne
+        df_estimering$run = k
+        df_estimering$test = "baseline"
+        df_estimering_compare = bind_rows(df_estimering_compare,df_estimering)
+        warning(paste0(Sys.time(),": ",k," runde(r) fullført"))
+        #tror ikke jeg må nullstille denne, ettersom prediksjon og run bare overskriver, mens resultater bind_rows?
+}
+for(k in 1:3){
+        for(i in min(df_estimering$round):max(df_estimering$round)){
+                if(i==1){
+                        modell_svm = train(points_nextround~total_points+I(total_points^2)+rundepoeng+now_cost+selected+as.factor(element_type)+as.factor(team)+ep_next+as.factor(status),
+                                data = arrange(filter(df_estimering,round==1),round),
+                                method = "svmRadial",
+                                tuneLength = 3,
+                                trControl = kontroll
+                                )
+                        df_estimering$prediksjon[df_estimering$round==1] = predict(modell_svm,newdata=filter(df_estimering,round==1))
+                df_estimering = lagvelgemaskin(df_estimering,runde=1)
+                df_resultater = bind_rows(df_resultater,data.frame(poengberegningsmaskin(df_original,df_estimering,modell="svm_radial",runde=1)))
+                        }
+                if(i>1){
+                        modell_svm = train(points_nextround~total_points+I(total_points^2)+rundepoeng+now_cost+selected+as.factor(element_type)+as.factor(team)+ep_next+as.factor(status),
+                                data = arrange(filter(df_estimering,round<i),round),
+                                method = "svmRadial",
+                                tuneLength = 3,
+                                trControl = kontroll
+                                )
+                        df_estimering$prediksjon[df_estimering$round==i] = predict(modell_svm,newdata=filter(df_estimering,round==i))
+                        df_estimering = lagvelgemaskin(df_estimering,runde=i)
+                df_resultater = bind_rows(df_resultater,poengberegningsmaskin(df_original,df_estimering,modell="svm_radial",runde=i))
+                }
+        }
+        df_resultater$run = k
+        df_resultater$test = "baseline+status"
+        df_resultater_compare = bind_rows(df_resultater_compare,df_resultater)
+        df_resultater = data.frame() #må nullstille denne
+        df_estimering$run = k
+        df_estimering$test = "baseline+status"
+        df_estimering_compare = bind_rows(df_estimering_compare,df_estimering)
+        warning(paste0(Sys.time(),": ",k," runde(r) fullført"))
+}
+
+#samme som over, men med repeated vs, 3x10
+kontroll = trainControl(method="repeatedcv",number=10,repeats=3)
+for(k in 1:3){
+        for(i in min(df_estimering$round):max(df_estimering$round)){
+                if(i==1){
+                        modell_svm = train(points_nextround~total_points+I(total_points^2)+rundepoeng+now_cost+selected+as.factor(element_type)+as.factor(team)+ep_next+as.factor(status),
+                                data = arrange(filter(df_estimering,round==1),round),
+                                method = "svmRadial",
+                                tuneLength = 3,
+                                trControl = kontroll
+                                )
+                        df_estimering$prediksjon[df_estimering$round==1] = predict(modell_svm,newdata=filter(df_estimering,round==1))
+                df_estimering = lagvelgemaskin(df_estimering,runde=1)
+                df_resultater = bind_rows(df_resultater,data.frame(poengberegningsmaskin(df_original,df_estimering,modell="svm_radial",runde=1)))
+                        }
+                if(i>1){
+                        modell_svm = train(points_nextround~total_points+I(total_points^2)+rundepoeng+now_cost+selected+as.factor(element_type)+as.factor(team)+ep_next+as.factor(status),
+                                data = arrange(filter(df_estimering,round<i),round),
+                                method = "svmRadial",
+                                tuneLength = 3,
+                                trControl = kontroll
+                                )
+                        df_estimering$prediksjon[df_estimering$round==i] = predict(modell_svm,newdata=filter(df_estimering,round==i))
+                        df_estimering = lagvelgemaskin(df_estimering,runde=i)
+                df_resultater = bind_rows(df_resultater,poengberegningsmaskin(df_original,df_estimering,modell="svm_radial",runde=i))
+                }
+        }
+        df_resultater$run = k
+        df_resultater$test = "baseline+status+rcv"
+        df_resultater_compare = bind_rows(df_resultater_compare,df_resultater)
+        df_resultater = data.frame() #må nullstille denne
+        df_estimering$run = k
+        df_estimering$test = "baseline+status+rcv"
+        df_estimering_compare = bind_rows(df_estimering_compare,df_estimering)
+        warning(paste0(Sys.time(),": ",k," runde(r) fullført"))
+}
+
+#skriver dataene
+write.csv2(df_estimering_compare,"data/modelltesting-05-07-17.csv",row.names=FALSE)
+write.csv2(df_resultater_compare,"data/modelltesting_resultat-05-07-17.csv",row.names=FALSE)
+
+#hvis allerede kjørt over, les heller inn dataene - det tar tid å kjøre
+#df_estimering_compare =read.csv2("data/modelltesting-01-06-17.csv",stringsAsFactors=FALSE)
+#df_resultater_compare =read.csv2("data/modelltesting_resultater-01-06-17.csv",stringsAsFactors=FALSE)
+```
+
+
+```{r}
+#df_resultater_compare = df_resultater_compare[-85:-87,]
+df_resultater_compare$run_test = paste0(df_resultater_compare$test,"_",df_resultater_compare$run)
+df_resultater_compare = group_by(df_resultater_compare,run_test)%>%mutate(Poeng_totalt = cumsum(Poeng))
+qplot(round,Poeng,colour=fct_reorder2(as.factor(run_test),parse_number(round),Poeng),data=df_resultater_compare,geom="line")+
+        labs(colour="testrun",title="Poeng etter runde og modell")
+qplot(round,Poeng_totalt,colour=fct_reorder2(as.factor(run_test),parse_number(round),Poeng_totalt),data=df_resultater_compare,geom="line")+
+        labs(colour="testrun",title="Totale poeng etter runde og modell")
+select(arrange(filter(df_resultater_compare,round==14),desc(Poeng_totalt)),-test)
+```
+
+###Oppsummert
+Som vi ser av figurene gir ikke status-informasjonen noen klar forbedring. Det er stor variasjon mellom poengresultatene fra modellene med status-variabelen inkludert. Kryssvalidering med repeated cv (10x3) gir litt bedre resultater, men hvorvidt dette er tilfeldig eller om det skyldes at datasettet ikke får konstant-problemet vet jeg ikke.
+
+Dette betyr altså at status-variabelen ikke gir noen ny informasjon som setter modellen i stand til å helt klart skille tydeligere mellom spillere som kommer til å få mange poeng, og de andre spillerne.
+
+##Flernivåmodell
+
+Litt eksperimentering først, basert på https://www.jaredknowles.com/journal/2013/11/25/getting-started-with-mixed-effect-models-in-r, samt Gelman og Hill.
+
+Datamaterialet har en flernivåstruktur: spillerne er organisert i 16 lag, og lagene deltar i runder (p.t. 18 runder, ved sesongens slutt blir det 30). Rundene kan forstås som en tidsdimensjon, og kan modelleres med tidsserieteknikker, men også flernivåmodeller. 
+
+En flernivåmodell kan være passende ettersom poengsummen den enkelte spiller får påvirkes av lagets innsats, og den enkelte observasjonen er dermed ikke uavhengig av de andre spillerne - forskjellene er mindre enn det rene antallet observasjoner skulle tilsi. Substansielt sett kan det også være interessant å inkludere variabler på lagnivå - som oddsen for at laget skal vinne den neste kampen, og dermed (antakeligvis) at spillerne på vinnerlaget får flere poeng enn taperlaget.
+
+En annen måte å se det på er å se på hver spiller som et nivå, og hver runde som en observasjon av den spilleren.
+
+Som vi ser av grafene under er fordelingene ganske like for alle runder under ett, og for alle lagene innenfor hver runde. Forskjellene blir større mellom lagene for noen  tilfeldig utvalgte runder. Dette tyder på at nivå 2-variabelen som bør brukes kanskje er lag-runder.
+
+```{r}
+qplot(total_points,facets=~team_navn,geom="density",data=df_estimering)
+qplot(total_points,facets=~as.factor(round),geom="density",data=df_estimering)
+qplot(total_points,facets=as.factor(round)~team_navn+.,geom="density",data=filter(df_estimering,round==7:10))
+```
+
+```{r}
+M0_team = lmer(total_points~1+(1|team_navn),data=df_estimering)
+#display(M0) #fra arm-pakka, kompanjong til Gelman og Hill?
+summary(M0_team)
+M0_round = lmer(total_points~1+(1|round),data=df_estimering)
+#display(M0) #fra arm-pakka, kompanjong til Gelman og Hill?
+summary(M0_round)
+df_estimering$team_round = paste0(df_estimering$team_navn,"_",df_estimering$round)
+M0_teamround = lmer(total_points~1+(1|team_round),data=df_estimering)
+#display(M0) #fra arm-pakka, kompanjong til Gelman og Hill?
+summary(M0_teamround)
+M0_player = lmer(total_points~1+(1|id_player),data=df_estimering)
+#display(M0) #fra arm-pakka, kompanjong til Gelman og Hill?
+summary(M0_player)
+```
+
+Gitt at jeg leser dette korrekt, så er variansen på nivå 1-restleddet (individene) 6.18 og mellom laget på 0.08 - eller 1.3 % av total varians. Variansen er derimot 0 på det øvre nivået hvis jeg bruker runde-variabelen som nivå 2-variabel. Med lagrunder som grupperingsvariabel får jeg derimot 5.96 på individnivået og 0.29 på gruppenivå - eller 4.6 %. Langt det meste er altså fortsatt på individnivået, men som vi så i grafikken over er variasjonen størst når en ser både på lag og runde samtidig.
+
+Hvis jeg bruker hver enkelt spiller som grupperingsnivå, får jeg derimot 1.95 på nivå 2 og 4.29 på nivå 1 - eller altså 31 % av variansen på grupperingsnivået.
+
+Hva så med den fulle modellen? Jeg får en beskjed om at jeg bør vurdere å rescale variabler, ettersom de er på svært forskjellige skalaer. Ettersom jeg ikke er direkte interessert i tolkning av koeffisientene, velger jeg i første omgang å beholde dem som de er. Til slutt må jeg teste for stabilitet.
+
+```{r}
+M1_teamround = lmer(points_nextround~total_points+rundepoeng+now_cost+selected+element_type+ep_next+(1|team_round),data=filter(df_estimering,round<15))
+M1_player = lmer(points_nextround~total_points+rundepoeng+now_cost+selected+element_type+ep_next+team+(1|id_player),data=filter(df_estimering,round<15))
+arm::display(M1_teamround)
+arm::display(M1_player)
+```
+
+Får jeg predikert verdier med disse modellene? Det ser ut til å fungere, men verdiene jeg får fra modellen gir ikke rom for å velge et lag - teamchooser-algoritmen feiler. Etter litt skruing (det gjaldt å joine resultatene tilbake, ikke bare legge dem inn), ser det ut til å fungere.
+
+```{r}
+
+#TEAM_ROUND
+df_estimering$prediksjon[df_estimering$round==1] = predict(M1_teamround,newdata=filter(df_estimering,round==1),allow.new.levels=TRUE)
+qplot(prediksjon,total_points,data=filter(df_estimering,round==2))
+df_estimering = lagvelgemaskin(df_estimering,runde=2)
+filter(df_estimering,round==15,team_now==1)
+df_resultater = poengberegningsmaskin(df_original,df_estimering,modell="lmm",runde=15)
+
+#ID_PLAYER
+df_estimering$prediksjon[df_estimering$round==15] = predict(M1_player,newdata=filter(df_estimering,round==15),allow.new.levels=TRUE)
+qplot(prediksjon,total_points,data=filter(df_estimering,round==15))
+df_estimering = lagvelgemaskin(df_estimering,runde=15)
+filter(df_estimering,round==15,team_now==1)
+df_resultater = poengberegningsmaskin(df_original,df_estimering,modell="lmm",runde=15)
+
+```
+
+###Gruppenivåvariabel: odds
+### Odds for kommende kamper
+
+```{r,include=FALSE}
+df_2017 = kampdatagrabber(url_data = "http://www.nifs.no/kamper.php?land=1&t=5&u=673879", tidspunkt="2017-05-17", aar ="2017",neste=FALSE)
+
+df_2017$hjemme_sannsynlighet = round((1/parse_number(df_2017$hjemme_odds))*100,0)
+df_2017$borte_sannsynlighet = round((1/parse_number(df_2017$borte_odds))*100,0)
+
+df_odds = select(df_2017,runde,hjemmelag,bortelag,hjemme_sannsynlighet,borte_sannsynlighet)
+
+df_odds_hjemme = gather(df_odds,sted,lag,hjemmelag:bortelag)%>%
+        filter(sted=="hjemmelag")%>%
+        select(runde,seier_sannsynlighet=hjemme_sannsynlighet,bane=sted,lag)
+
+df_odds_borte = gather(df_odds,sted,lag,hjemmelag:bortelag)%>%
+        filter(sted=="bortelag")%>%
+        select(runde,seier_sannsynlighet=borte_sannsynlighet,bane=sted,lag)
+
+df_odds = bind_rows(df_odds_hjemme,df_odds_borte)
+
+#så må runde kodes om
+df_odds$runde = parse_integer(gsub("Runde ","",df_odds$runde,fixed=TRUE))
+#lag
+
+temp_json = GET("https://fantasy.vg.no/drf/bootstrap-static")
+temp_df = fromJSON(content(temp_json,"text",encoding="UTF-8"))
+df_lag = select(temp_df[[5]],name,short_name)
+df_lag$name[df_lag$name == "Kristiansund BK"] = "Kristiansund"
+df_lag$name[df_lag$name == "Sogndal IL"] = "Sogndal"
+df_lag$name[df_lag$name == "FK Haugesund"] = "Haugesund"
+df_lag$name[df_lag$name == "Aalesunds FK"] = "Aalesund"
+df_lag$name[df_lag$name == "Viking FK"] = "Viking"
+df_odds$lag = trimws(df_odds$lag,"right")
+df_odds = left_join(df_odds,df_lag,by=c("lag"="name"))
+df_odds$short_name[df_odds$short_name=="S08"] = "SO8"
+
+df_estimering = left_join(df_estimering,select(df_odds,-lag),by=c("round"="runde","team_navn"="short_name"))
+#legger dette også inn i dataprepper
+```
+
+```{r}
+#TEAM_ROUND
+M1_teamround = lmer(points_nextround~total_points+rundepoeng+now_cost+selected+element_type+ep_next+(1|team_round),data=filter(df_estimering,round<15))
+M2_teamround = lmer(points_nextround~total_points+rundepoeng+now_cost+selected+element_type+ep_next+seier_sannsynlighet+(1|team_round),data=filter(df_estimering,round<15))
+arm::display(M1_teamround)
+arm::display(M2_teamround)
+```
+
+```{r}
+M1_idplayer = lmer(points_nextround~total_points+rundepoeng+now_cost+selected+element_type+ep_next+team+(1|id_player),data=filter(df_estimering,round<15))
+M2_idplayer = lmer(points_nextround~total_points+rundepoeng+now_cost+selected+element_type+team+(1+total_points|id_player)+ep_next, data=filter(df_estimering,round<15))
+arm::display(M1_idplayer)
+arm::display(M2_idplayer)
+```
+
+###Endelig sammenlikning
+
+```{r}
+df_estimering$prediksjon = NA
+df_resultater = data.frame()
+df_resultater_compare = data.frame()
+df_estimering_compare = data.frame()
+
+#M0: SVM - POINTS_NEXTROUNT ~ lmer(...vars)
+temp_modellnavn = "baseline_svm"
+#trening og testsett for tuningen i treningen.
+train_nr = floor(nrow(filter(df_estimering,round==1))*.8)
+test_nr = ceiling(nrow(filter(df_estimering,round==1))*.2)
+kontroll = trainControl(method="timeslice",initialWindow=train_nr,horizon=test_nr,fixedWindow=TRUE)
+##loop
+for(k in 1:1){
+        for(i in min(df_estimering$round):max(df_estimering$round)){
+                if(i==1){
+                df_estimering = lagvelgemaskin(df_estimering,runde=1)
+                df_resultater = bind_rows(df_resultater,data.frame(poengberegningsmaskin(df_original,df_estimering,modell=temp_modellnavn,runde=1)))
+                }
+                if(i>2){
+                       modell_svm = train(points_nextround~total_points+I(total_points^2)+rundepoeng+now_cost+selected+as.factor(element_type)+as.factor(team)+ep_next,
+                        data = arrange(filter(df_estimering,round<17),round),
+                        method = "svmRadial",
+                        tuneLength = 9,
+                        trControl = kontroll
+                        )
+                        df_estimering$prediksjon[df_estimering$round==i] = predict(modell_svm,newdata=filter(df_estimering,round==i),allow.new.levels=TRUE)
+                        df_estimering = lagvelgemaskin(df_estimering,runde=i)
+                df_resultater = bind_rows(df_resultater,poengberegningsmaskin(df_original,df_estimering,modell=temp_modellnavn,runde=i))
+                }
+        }
+        df_resultater$run = k
+        df_resultater$test = temp_modellnavn
+        df_resultater_compare = bind_rows(df_resultater_compare,df_resultater)
+        df_resultater = data.frame() #må nullstille denne
+        df_estimering$run = k
+        df_estimering$test = temp_modellnavn
+        df_estimering_compare = bind_rows(df_estimering_compare,df_estimering)
+        warning(paste0(Sys.time(),": ",k," runde(r) fullført"))
+}
+
+#M1: LMM - POINTS_NEXTROUNT ~ lmer(...vars,team_round)
+temp_modellnavn = "lmm_teamxround"
+#min(df_estimering$round):max(df_estimering$round)
+##loop
+for(k in 1:1){
+        for(i in min(df_estimering$round):max(df_estimering$round)){
+                if(i==1){
+                df_estimering = lagvelgemaskin(df_estimering,runde=1)
+                df_resultater = bind_rows(df_resultater,data.frame(poengberegningsmaskin(df_original,df_estimering,modell=temp_modellnavn,runde=1)))
+                }
+                if(i>2){
+                       modell_lmm = lmer(points_nextround~total_points+rundepoeng+now_cost+selected+element_type+team+(1|team_round)+ep_next, data = filter(df_estimering,round<i)
+                                      )
+                        df_estimering$prediksjon[df_estimering$round==i] = predict(modell_lmm,newdata=filter(df_estimering,round==i),allow.new.levels=TRUE)
+                        df_estimering = lagvelgemaskin(df_estimering,runde=i)
+                df_resultater = bind_rows(df_resultater,poengberegningsmaskin(df_original,df_estimering,modell=temp_modellnavn,runde=i))
+                }
+        }
+        df_resultater$run = k
+        df_resultater$test = temp_modellnavn
+        df_resultater_compare = bind_rows(df_resultater_compare,df_resultater)
+        df_resultater = data.frame() #må nullstille denne
+        df_estimering$run = k
+        df_estimering$test = temp_modellnavn
+        df_estimering_compare = bind_rows(df_estimering_compare,df_estimering)
+        warning(paste0(Sys.time(),": ",k," runde(r) fullført"))
+}
+
+#M2: LMM - POINTS_NEXTROUNT ~ lmer(...vars,id_player)
+temp_modellnavn = "lmm_idplayer"
+#min(df_estimering$round):max(df_estimering$round)
+##loop
+for(k in 1:1){
+        for(i in min(df_estimering$round):max(df_estimering$round)){
+                if(i==1){
+                df_estimering = lagvelgemaskin(df_estimering,runde=1)
+                df_resultater = bind_rows(df_resultater,data.frame(poengberegningsmaskin(df_original,df_estimering,modell=temp_modellnavn,runde=1)))
+                }
+                if(i>2){
+                       modell_lmm = lmer(points_nextround~total_points+rundepoeng+now_cost+selected+element_type+team+(1|id_player)+ep_next, data = filter(df_estimering,round<i)
+                                      )
+                        df_estimering$prediksjon[df_estimering$round==i] = predict(modell_lmm,newdata=filter(df_estimering,round==i),allow.new.levels=TRUE)
+                        df_estimering = lagvelgemaskin(df_estimering,runde=i)
+                df_resultater = bind_rows(df_resultater,poengberegningsmaskin(df_original,df_estimering,modell=temp_modellnavn,runde=i))
+                }
+        }
+        df_resultater$run = k
+        df_resultater$test = temp_modellnavn
+        df_resultater_compare = bind_rows(df_resultater_compare,df_resultater)
+        df_resultater = data.frame() #må nullstille denne
+        df_estimering$run = k
+        df_estimering$test = temp_modellnavn
+        df_estimering_compare = bind_rows(df_estimering_compare,df_estimering)
+        warning(paste0(Sys.time(),": ",k," runde(r) fullført"))
+}
+
+#M3: LMM - POINTS_NEXTROUNT ~ lmer(...vars,team_round+sannsynlighet)
+temp_modellnavn = "lmm_teamround_odds"
+#min(df_estimering$round):max(df_estimering$round)
+##loop
+for(k in 1:1){
+        for(i in min(df_estimering$round):max(df_estimering$round)){
+                if(i==1){
+                df_estimering = lagvelgemaskin(df_estimering,runde=1)
+                df_resultater = bind_rows(df_resultater,data.frame(poengberegningsmaskin(df_original,df_estimering,modell=temp_modellnavn,runde=1)))
+                }
+                if(i>2){
+                       modell_lmm = lmer(points_nextround~total_points+rundepoeng+now_cost+selected+element_type+team+seier_sannsynlighet+(1|team_round)+ep_next, data = filter(df_estimering,round<i)
+                                      )
+                        df_estimering$prediksjon[df_estimering$round==i] = predict(modell_lmm,newdata=filter(df_estimering,round==i),allow.new.levels=TRUE)
+                        df_estimering = lagvelgemaskin(df_estimering,runde=i)
+                df_resultater = bind_rows(df_resultater,poengberegningsmaskin(df_original,df_estimering,modell=temp_modellnavn,runde=i))
+                }
+        }
+        df_resultater$run = k
+        df_resultater$test = temp_modellnavn
+        df_resultater_compare = bind_rows(df_resultater_compare,df_resultater)
+        df_resultater = data.frame() #må nullstille denne
+        df_estimering$run = k
+        df_estimering$test = temp_modellnavn
+        df_estimering_compare = bind_rows(df_estimering_compare,df_estimering)
+        warning(paste0(Sys.time(),": ",k," runde(r) fullført"))
+}
+
+```
+
+```{r}
+df_resultater_compare$run_test = paste0(df_resultater_compare$test,"_",df_resultater_compare$run)
+df_resultater_compare = group_by(df_resultater_compare,run_test)%>%mutate(Poeng_totalt = cumsum(Poeng))
+qplot(round,Poeng,colour=fct_reorder2(as.factor(run_test),parse_number(round),Poeng),data=df_resultater_compare,geom="line")+
+        labs(colour="testrun",title="Poeng etter runde og modell")
+qplot(round,Poeng_totalt,colour=fct_reorder2(as.factor(run_test),parse_number(round),Poeng_totalt),data=df_resultater_compare,geom="line")+
+        labs(colour="testrun",title="Totale poeng etter runde og modell")
+```
+
+Hvis vi skal tro denne gjennomkjøringa, så gir idplayer og team_round forbedringer av modellen. Å legge til sannsynligheten for seier (som gitt av Norsk tippings odds) gir imidlertid dårligere resultater, til tross for at modellen ble forbedret som målt ved reduksjon i AIC. Det spørs om oddsene enten er lite relevante, eller introduserer mer støy enn nødvendig for prediksjonen.
+
+Ganske overraskende er imidlertid SVM-modellen bedre enn flernivåmodellene. Og det er altså fortsatt ingen vits i å bytte dem ut.
